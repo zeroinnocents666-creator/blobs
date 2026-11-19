@@ -45,9 +45,12 @@ class Msg(val role: String, var text: String, val time: Long) {
     var model: String = ""
     var note: String = ""
     var sources: List<Pair<String, String>> = emptyList()
+    /** v1.2: files attached to a user message (stored in files/attachments/<botId>/). */
+    var atts: List<Att> = emptyList()
 
     fun json(): JSONObject {
         val o = JSONObject().put("r", role).put("t", text).put("at", time)
+        if (atts.isNotEmpty()) o.put("a", JSONArray().apply { atts.forEach { put(it.json()) } })
         if (model.isNotEmpty()) o.put("m", model)
         if (note.isNotEmpty()) o.put("n", note)
         if (sources.isNotEmpty()) {
@@ -59,6 +62,7 @@ class Msg(val role: String, var text: String, val time: Long) {
     companion object {
         fun from(o: JSONObject) = Msg(o.optString("r", "user"), o.optString("t", ""), o.optLong("at", 0L)).apply {
             model = o.optString("m", ""); note = o.optString("n", "")
+            o.optJSONArray("a")?.let { a -> atts = (0 until a.length()).mapNotNull { i -> a.optJSONObject(i)?.let { Att.from(it) } } }
             val a = o.optJSONArray("src")
             if (a != null) sources = (0 until a.length()).mapNotNull { i ->
                 val x = a.optJSONObject(i) ?: return@mapNotNull null
@@ -135,6 +139,7 @@ object Store {
     fun delete(ctx: Context, id: String) {
         saveBots(ctx, bots(ctx).filter { it.id != id })
         chatFile(ctx, id).delete()
+        Attach.deleteBot(ctx, id)
     }
 
     fun chat(ctx: Context, id: String): MutableList<Msg> {
@@ -151,9 +156,9 @@ object Store {
         write(chatFile(ctx, id), a.toString())
     }
 
-    fun clearChat(ctx: Context, id: String) { chatFile(ctx, id).delete() }
+    fun clearChat(ctx: Context, id: String) { chatFile(ctx, id).delete(); Attach.deleteBot(ctx, id) }
 
-    fun clearAll(ctx: Context) { File(ctx.filesDir, "chats").listFiles()?.forEach { it.delete() } }
+    fun clearAll(ctx: Context) { File(ctx.filesDir, "chats").listFiles()?.forEach { it.delete() }; Attach.deleteAll(ctx) }
 
     private fun write(f: File, s: String) {
         val tmp = File(f.parentFile, f.name + ".tmp")

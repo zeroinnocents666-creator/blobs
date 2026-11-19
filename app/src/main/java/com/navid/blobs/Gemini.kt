@@ -5,7 +5,10 @@ import android.os.Handler
 import android.os.Looper
 import org.json.JSONArray
 import org.json.JSONObject
+import android.util.Base64
+import android.util.Base64OutputStream
 import java.io.BufferedReader
+import java.io.File
 import java.io.InputStreamReader
 import java.net.ConnectException
 import java.net.HttpURLConnection
@@ -51,14 +54,39 @@ object Gemini {
         fun onMigrated()
     }
 
-    /** Builds "contents": last [MAX_TURNS] turns, starting with a user turn, same-role neighbours merged. */
-    fun contents(history: List<Msg>): JSONArray {
-        var msgs = history.filter { it.text.isNotBlank() }
+    /** Request contents plus the attachment files that are streamed (base64) in place of their placeholder tokens. */
+    class Payload(val contents: JSONArray, val blobs: Map<String, File>, val hasMedia: Boolean)
+
+    private val TOKEN = Regex("@@BLOBSATT_[0-9a-f]+_[0-9]+@@")
+
+    /**
+     * Builds "contents": last [MAX_TURNS] turns, starting with a user turn, same-role neighbours merged.
+     * Attachments are sent in full only for the newest [Attach.MEDIA_TURNS] user turns that have them (and within
+     * [Attach.MAX_MESSAGE_BYTES] together); older ones become a short text placeholder such as "[image: name]".
+     */
+    fun contents(ctx: Context, botId: String, history: List<Msg>): Payload {
+        var msgs = history.filter { it.text.isNotBlank() || it.atts.isNotEmpty() }
         var users = 0; var start = 0
         for (i in msgs.indices.reversed()) {
             if (msgs[i].role == "user") { users++; start = i; if (users >= MAX_TURNS) break }
         }
         msgs = msgs.drop(start)
+
+        val full = java.util.IdentityHashMap<Msg, Boolean>()
+        var budget = 0L; var turns = 0
+        for (m in msgs.reversed()) {
+            if (m.role != "user" || m.atts.isEmpty()) continue
+            if (turns >= Attach.MEDIA_TURNS) break
+            val bytes = m.atts.sumOf { Attach.file(ctx, botId, it).let { f -> if (f.exists()) f.length() else 0L } }
+            if (turns == 0 && bytes > Attach.MAX_MESSAGE_BYTES)
+                throw Fail(Kind.FATAL, "These attachments are too big (${Attach.human(bytes)}). One message can carry about " +
+                    "${Attach.human(Attach.MAX_MESSAGE_BYTES)}. Remove a file or send a smaller PDF.")
+            if (budget + bytes > Attach.MAX_MESSAGE_BYTES) break
+            budget += bytes; turns++; full[m] = true
+        }
+
+        val nonce = java.lang.Long.toHexString(System.nanoTime())
+        val blobs = LinkedHashMap<String, File>()
         val arr = JSONArray()
         var lastRole = ""; var parts = JSONArray()
         for (m in msgs) {
@@ -66,15 +94,70 @@ object Gemini {
             if (role != lastRole && parts.length() > 0) {
                 arr.put(JSONObject().put("role", lastRole).put("parts", parts)); parts = JSONArray()
             }
-            parts.put(JSONObject().put("text", m.text)); lastRole = role
+            if (m.text.isNotBlank()) parts.put(JSONObject().put("text", m.text))
+            val isFull = full.containsKey(m)
+            for (a in m.atts) {
+                val f = Attach.file(ctx, botId, a)
+                val label = if (a.isImage()) "image" else "file"
+                if (!f.exists()) { parts.put(JSONObject().put("text", "[$label no longer available: ${a.name}]")); continue }
+                if (!isFull) { parts.put(JSONObject().put("text", "[$label: ${a.name}]")); continue }
+                when (a.kind) {
+                    "image", "pdf" -> {
+                        val tok = "@@BLOBSATT_${nonce}_${blobs.size}@@"
+                        blobs[tok] = f
+                        parts.put(JSONObject().put("inline_data", JSONObject().put("mime_type", a.mime).put("data", tok)))
+                    }
+                    else -> {
+                        val body = try { f.readText(Charsets.UTF_8) } catch (e: Exception) { "" }
+                        parts.put(JSONObject().put("text", "File: ${a.name}\n```\n$body\n```"))
+                    }
+                }
+            }
+            if (parts.length() == 0) parts.put(JSONObject().put("text", " "))
+            lastRole = role
         }
         if (parts.length() > 0) arr.put(JSONObject().put("role", lastRole).put("parts", parts))
-        return arr
+        return Payload(arr, blobs, blobs.isNotEmpty())
+    }
+
+    /** Writes [json] with every placeholder token replaced by the base64 of its file, streamed (no big strings in memory). */
+    private fun writeBody(c: HttpURLConnection, json: String, blobs: Map<String, File>) {
+        if (blobs.isEmpty()) {
+            val b = json.toByteArray(Charsets.UTF_8)
+            c.setFixedLengthStreamingMode(b.size)
+            c.outputStream.use { it.write(b) }
+            return
+        }
+        val pieces = ArrayList<Any>()
+        var i = 0
+        for (mt in TOKEN.findAll(json)) {
+            val f = blobs[mt.value] ?: continue
+            pieces.add(json.substring(i, mt.range.first).toByteArray(Charsets.UTF_8)); pieces.add(f)
+            i = mt.range.last + 1
+        }
+        pieces.add(json.substring(i).toByteArray(Charsets.UTF_8))
+        var total = 0L
+        for (p in pieces) total += if (p is ByteArray) p.size.toLong() else ((p as File).length() + 2) / 3 * 4
+        c.setFixedLengthStreamingMode(total)
+        c.outputStream.use { os ->
+            val keep = object : java.io.FilterOutputStream(os) {
+                override fun write(b: ByteArray, off: Int, len: Int) { out.write(b, off, len) }
+                override fun close() { flush() }
+            }
+            for (p in pieces) {
+                if (p is ByteArray) os.write(p)
+                else {
+                    val b64 = Base64OutputStream(keep, Base64.NO_WRAP)
+                    (p as File).inputStream().use { it.copyTo(b64, 64 * 1024) }
+                    b64.close()
+                }
+            }
+        }
     }
 
     // ---------- failures ----------
 
-    private enum class Kind { FATAL, QUOTA_DAY, QUOTA_SHORT, UNAVAILABLE, SERVER, BAD_THINKING, BAD_SEARCH }
+    private enum class Kind { FATAL, QUOTA_DAY, QUOTA_SHORT, UNAVAILABLE, SERVER, BAD_THINKING, BAD_SEARCH, BAD_MEDIA }
     private class Fail(val kind: Kind, val msg: String, val retryMs: Long = 0L) : Exception(msg)
     private class MidStream(msg: String) : Exception(msg)
     private class Result(val sources: List<Pair<String, String>>)
@@ -85,7 +168,7 @@ object Gemini {
      */
     fun stream(
         context: Context, key: String, attempts: List<Router.Attempt>, system: String, history: List<Msg>,
-        fast: Boolean, l: Listener
+        botId: String, fast: Boolean, l: Listener
     ): Call {
         val ctx = context.applicationContext
         val call = Call()
@@ -93,9 +176,10 @@ object Gemini {
             var lastMsg = "Gemini did not answer. Try again."
             var allQuota = true
             var migrated = false
+            var searchMediaFail = false
             try {
                 if (key.isBlank()) throw Fail(Kind.FATAL, "No API key yet. Add your Gemini API key in Settings.")
-                val contents = contents(history)
+                val contents = contents(ctx, botId, history)
                 for (a in attempts) {
                     if (call.cancelled) return@Thread
                     var thinking = true
@@ -112,7 +196,7 @@ object Gemini {
                     if (call.cancelled) return@Thread
                     val done = res
                     if (done != null) {
-                        val note = if (a.searchFallback) "search unavailable" else ""
+                        val note = if (!a.searchFallback) "" else if (searchMediaFail) "no search with files" else "search unavailable"
                         main.post { if (!call.cancelled) l.onDone(a.model, done.sources, note) }
                         return@Thread
                     }
@@ -126,10 +210,12 @@ object Gemini {
                         Kind.SERVER -> Limits.mark(ctx, a.model, a.search, now + 120_000L, "busy")
                         Kind.BAD_SEARCH -> Limits.mark(ctx, a.model, true, Limits.nextPacificMidnight(), "search not available")
                         Kind.BAD_THINKING -> Limits.mark(ctx, a.model, a.search, now + 600_000L, "rejected request")
+                        // A model that can't read these files is skipped for this reply only (text still works).
+                        Kind.BAD_MEDIA -> if (a.search) searchMediaFail = true
                     }
                     if (f.kind != Kind.QUOTA_DAY && f.kind != Kind.QUOTA_SHORT) allQuota = false
                     lastMsg = f.msg
-                    if (a.migrate && !migrated) {
+                    if (a.migrate && !migrated && f.kind != Kind.BAD_MEDIA) {
                         migrated = true; Prefs.setAuto(ctx, true)
                         main.post { if (!call.cancelled) l.onMigrated() }
                     }
@@ -151,10 +237,10 @@ object Gemini {
 
     /** One request to one model. Throws [Fail] before the first token, [MidStream] after it. */
     private fun once(
-        call: Call, key: String, a: Router.Attempt, system: String, contents: JSONArray, thinking: Boolean, l: Listener
+        call: Call, key: String, a: Router.Attempt, system: String, payload: Payload, thinking: Boolean, l: Listener
     ): Result {
         val body = JSONObject()
-            .put("contents", contents)
+            .put("contents", payload.contents)
             .put("systemInstruction", JSONObject().put("parts", JSONArray().put(JSONObject().put("text", system + Store.accuracyRules(a.search)))))
         val tc = if (thinking) Models.thinking(a.model, true) else null
         if (tc != null) body.put("generationConfig", JSONObject().put("thinkingConfig", tc))
@@ -173,9 +259,9 @@ object Gemini {
             c.setRequestProperty("Accept", "text/event-stream")
             c.setRequestProperty("Connection", "keep-alive")
             c.setRequestProperty("x-goog-api-key", key.trim())
-            c.outputStream.use { it.write(body.toString().toByteArray(Charsets.UTF_8)) }
+            writeBody(c, body.toString(), payload.blobs)
             val code = c.responseCode
-            if (code !in 200..299) throw classify(code, readErr(c), a)
+            if (code !in 200..299) throw classify(code, readErr(c), a, payload.hasMedia)
             var blockReason: String? = null
             var finish: String? = null
             BufferedReader(InputStreamReader(c.inputStream, Charsets.UTF_8), 8192).use { r ->
@@ -186,7 +272,7 @@ object Gemini {
                     if (data.isEmpty() || data == "[DONE]") continue
                     val o = try { JSONObject(data) } catch (e: Exception) { continue }
                     o.optJSONObject("error")?.let {
-                        val f = classify(it.optInt("code", 500), data, a)
+                        val f = classify(it.optInt("code", 500), data, a, payload.hasMedia)
                         if (gotText) throw MidStream(f.msg) else throw f
                     }
                     o.optJSONObject("promptFeedback")?.optString("blockReason")?.takeIf { it.isNotEmpty() }?.let { blockReason = it }
@@ -287,7 +373,7 @@ object Gemini {
         return (v * 1000).toLong()
     }
 
-    private fun classify(code: Int, body: String, a: Router.Attempt): Fail {
+    private fun classify(code: Int, body: String, a: Router.Attempt, media: Boolean = false): Fail {
         val model = a.model
         var message = ""; var status = ""; var reason = ""
         var perDay = false; var retry = 0L
@@ -327,6 +413,11 @@ object Gemini {
                 else Fail(Kind.UNAVAILABLE, "$name is not available for this key" + (if (message.isNotEmpty()) ": $message" else "."))
             code == 400 && low.contains("location") ->
                 Fail(Kind.FATAL, "Gemini API is not available in your region for this key.")
+            code == 413 || low.contains("payload size") || low.contains("request too large") || low.contains("exceeds the maximum") ->
+                Fail(Kind.FATAL, "This message is too big for Gemini. Send fewer or smaller files (about ${Attach.human(Attach.MAX_MESSAGE_BYTES)} per message).")
+            code == 400 && media && listOf("mime", "image", "inline", "media", "pdf", "document", "modality", "unsupported file", "file type")
+                .any { low.contains(it) } ->
+                Fail(Kind.BAD_MEDIA, "$name can't read this file type. " + message.ifEmpty { "" }.take(160))
             code == 400 && low.contains("thinking") ->
                 Fail(Kind.BAD_THINKING, "Request rejected: " + message.ifEmpty { "thinking settings" })
             code == 400 && a.search && (low.contains("search") || low.contains("grounding") || low.contains("tool")) ->

@@ -158,7 +158,15 @@ class HomeActivity : Activity() {
         mid.addView(text(r.bot.role.ifEmpty { "Assistant" }, 13f, Prefs.accent(this@HomeActivity)).apply {
             maxLines = 1; ellipsize = TextUtils.TruncateAt.END; setPadding(0, dp(1), 0, dp(2))
         })
-        val preview = r.last?.let { (if (it.role == "user") "You: " else "") + it.text.replace(Regex("[`*#_>]"), "").replace('\n', ' ').trim() }
+        val preview = r.last?.let { m ->
+            val t = m.text.replace(Regex("[`*#_>]"), "").replace('\n', ' ').trim()
+            val body = if (t.isNotEmpty()) t else when {
+                m.atts.isEmpty() -> ""
+                m.atts.all { it.isImage() } -> if (m.atts.size == 1) "Photo" else "${m.atts.size} photos"
+                m.atts.size == 1 -> m.atts[0].name
+                else -> "${m.atts.size} attachments"
+            }
+            (if (m.role == "user") "You: " else "") + body }
             ?: "Say hi to ${r.bot.name}"
         mid.addView(text(preview, 14f, C.SUB).apply { maxLines = 1; ellipsize = TextUtils.TruncateAt.END })
         addView(mid, lp(0, WRAP, 1f))
